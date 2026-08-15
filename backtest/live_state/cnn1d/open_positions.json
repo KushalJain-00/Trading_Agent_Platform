@@ -1,0 +1,16 @@
+[
+  {
+    "ticker": "TCS",
+    "entry_price": 3362.5043,
+    "size": 588.9652641671744,
+    "entry_time": "2022-12-14 13:05:00",
+    "holding_bars": 0
+  },
+  {
+    "ticker": "ABB",
+    "entry_price": 3004.4506,
+    "size": 659.1462975050321,
+    "entry_time": "2022-12-14 13:11:00",
+    "holding_bars": 0
+  }
+]

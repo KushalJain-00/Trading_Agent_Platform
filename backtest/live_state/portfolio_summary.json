@@ -1,0 +1,23 @@
+{
+  "lstm": {
+    "equity": 98954586.8158651,
+    "cash": 96977625.10499217,
+    "n_positions": 1,
+    "total_trades": 309,
+    "bars_processed": 6300
+  },
+  "cnn1d": {
+    "equity": 99014976.3276145,
+    "cash": 95056566.53143291,
+    "n_positions": 2,
+    "total_trades": 276,
+    "bars_processed": 6300
+  },
+  "cnn_lstm": {
+    "equity": 98984705.77364582,
+    "cash": 95027506.13033009,
+    "n_positions": 2,
+    "total_trades": 296,
+    "bars_processed": 6300
+  }
+}
