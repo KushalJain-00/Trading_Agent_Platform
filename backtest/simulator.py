@@ -14,18 +14,27 @@ from dataclasses import dataclass
 def run_historical_backtest(signals_df, prices_df, capital=100_000_000,
                              position_size_pct=0.02, cost_bps=5, spread_bps=3,
                              latency_bars=1, output_dir=None,
-                             confidence_threshold=0.0, min_holding_bars=1):
+                             confidence_threshold=0.0, min_holding_bars=1,
+                             max_positions=0, max_position_pct=0.0,
+                             allocation="equal",
+                             stop_loss_pct=0.0, take_profit_pct=0.0):
     """Vectorized historical backtest with optional signal filters.
 
     Filters:
       - confidence_threshold: Buy signals below this confidence become Hold
       - min_holding_bars: once long, ignore Sell signals until this many bars pass
+      - max_positions: max concurrent open positions (0=unlimited)
+      - max_position_pct: max fraction of capital per position (0=unlimited)
+      - allocation: 'equal' | 'confidence-weighted' | 'top-N'
+      - stop_loss_pct: force exit if position drops this fraction (0=disabled)
+      - take_profit_pct: force exit if position gains this fraction (0=disabled)
     """
     # ── Unfiltered baseline (for before/after comparison) ────────────
     _baseline = _run_backtest_core(
         signals_df, prices_df, capital, position_size_pct,
         cost_bps, spread_bps, latency_bars, output_dir=None,
         confidence_threshold=0.0, min_holding_bars=1,
+        stop_loss_pct=0.0, take_profit_pct=0.0,
     )
 
     # ── Filtered run ────────────────────────────────────────────────
@@ -39,6 +48,11 @@ def run_historical_backtest(signals_df, prices_df, capital=100_000_000,
         cost_bps, spread_bps, latency_bars, output_dir,
         confidence_threshold=confidence_threshold,
         min_holding_bars=min_holding_bars,
+        max_positions=max_positions,
+        max_position_pct=max_position_pct,
+        allocation=allocation,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
     )
 
     n_before = len(_baseline.get_trade_log_df())
@@ -66,13 +80,23 @@ def run_historical_backtest(signals_df, prices_df, capital=100_000_000,
 
 def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
                         cost_bps, spread_bps, latency_bars, output_dir,
-                        confidence_threshold, min_holding_bars):
+                        confidence_threshold, min_holding_bars,
+                        max_positions=0, max_position_pct=0.0,
+                        allocation="equal",
+                        stop_loss_pct=0.0, take_profit_pct=0.0):
     """Core backtest logic, reused for baseline and filtered runs.
 
     Equity curve uses a proper multi-asset portfolio ledger: at every bar
     in chronological order, we maintain a running cash balance + dict of
     open positions, compute mark-to-market equity, and verify it matches
     the trade log's summed P&L.
+
+    allocation modes:
+      'equal'              — fixed position_size_pct per ticker (default)
+      'confidence-weighted' — size scaled by signal confidence
+      'top-N'              — only enter top-N signals by confidence per bar
+    max_positions: max concurrent open positions (0=unlimited)
+    max_position_pct: max fraction of capital per position (0=unlimited)
     """
     sigs = signals_df[["ticker", "timestamp", "predicted_signal", "predicted_confidence"]].copy()
     sigs["timestamp"] = pd.to_datetime(sigs["timestamp"])
@@ -87,6 +111,16 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
     if confidence_threshold > 0.0:
         weak_buy = (merged["predicted_signal"] == "Buy") & (merged["predicted_confidence"] < confidence_threshold)
         merged.loc[weak_buy, "predicted_signal"] = "Hold"
+
+    # ── Top-N mode: only keep the N highest-confidence Buys per bar ─
+    if allocation == "top-N" and max_positions > 0:
+        buy_mask = merged["predicted_signal"] == "Buy"
+        for ts, group in merged.loc[buy_mask].groupby("timestamp"):
+            if len(group) <= max_positions:
+                continue
+            keep_idx = group.nlargest(max_positions, "predicted_confidence").index
+            drop_idx = group.index.difference(keep_idx)
+            merged.loc[drop_idx, "predicted_signal"] = "Hold"
 
     # ── Base position vector ────────────────────────────────────────
     merged["raw_pos"] = (merged["predicted_signal"] == "Buy").astype(int)
@@ -117,48 +151,6 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
     cost_frac = cost_bps / 10000
     half_spread = spread_bps / 2 / 10000
 
-    # ── Trade log from position changes ─────────────────────────────
-    prev_pos = merged.groupby("ticker")["position"].shift(1).fillna(0)
-    entries = merged[(merged["position"] == 1) & (prev_pos == 0)].copy()
-    exits = merged[(merged["position"] == 0) & (prev_pos == 1)].copy()
-
-    trades = []
-    for ticker in merged["ticker"].unique():
-        t_entries = entries[entries["ticker"] == ticker].reset_index()
-        t_exits = exits[exits["ticker"] == ticker].reset_index()
-        n = min(len(t_entries), len(t_exits))
-        for i in range(n):
-            e = t_entries.iloc[i]
-            x = t_exits.iloc[i]
-            entry_price = e["close"] * (1 + half_spread)
-            exit_price = x["close"] * (1 - half_spread)
-            size = (capital * position_size_pct) / entry_price
-            gross_pnl = (exit_price - entry_price) * size
-            tc = abs(exit_price * size) * cost_frac + size * (exit_price * half_spread)
-            trades.append({
-                "entry_time": str(e["timestamp"]), "exit_time": str(x["timestamp"]),
-                "ticker": ticker, "direction": "long",
-                "entry_price": entry_price, "exit_price": exit_price,
-                "size": size, "gross_pnl": gross_pnl,
-                "net_pnl": gross_pnl - tc, "costs": tc,
-                "holding_bars": int(x["index"] - e["index"]),
-            })
-        if len(t_entries) > len(t_exits):
-            e = t_entries.iloc[len(t_exits)]
-            entry_price = e["close"] * (1 + half_spread)
-            size = (capital * position_size_pct) / entry_price
-            trades.append({
-                "entry_time": str(e["timestamp"]), "exit_time": str(merged.iloc[-1]["timestamp"]),
-                "ticker": ticker, "direction": "long",
-                "entry_price": entry_price, "exit_price": e["close"],
-                "size": size, "gross_pnl": 0, "net_pnl": 0, "costs": 0,
-                "holding_bars": 0,
-            })
-
-    trade_df = pd.DataFrame(trades) if trades else pd.DataFrame(
-        columns=["entry_time", "exit_time", "ticker", "direction", "entry_price",
-                 "exit_price", "size", "gross_pnl", "net_pnl", "costs", "holding_bars"])
-
     # ── Equity curve — array-indexed loop (dict-free, ~3x faster) ──
     all_bars = merged.sort_values("timestamp").reset_index(drop=True)
     n_bars = len(all_bars)
@@ -166,6 +158,7 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
     bar_positions = all_bars["position"].values.astype(np.int64)
     bar_tickers = all_bars["ticker"].values
     bar_timestamps = all_bars["timestamp"].values
+    bar_confidences = all_bars["predicted_confidence"].values.astype(np.float64)
     bar_prev_positions = all_bars.groupby("ticker")["position"].shift(1).fillna(0).values.astype(np.int64)
 
     # Map tickers to integer IDs for O(1) array indexing instead of dict lookup
@@ -178,11 +171,18 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
     current_shares = np.zeros(n_tickers, dtype=np.float64)
     current_ep = np.zeros(n_tickers, dtype=np.float64)
     last_price_arr = np.zeros(n_tickers, dtype=np.float64)
+    is_open = np.zeros(n_tickers, dtype=np.int32)
 
     cash = float(capital)
     mtm_sum = 0.0
+    n_open = 0
     eq_timestamps = np.empty(n_bars, dtype=bar_timestamps.dtype)
     eq_values = np.empty(n_bars, dtype=np.float64)
+
+    # Record trades during the loop so they always match equity curve
+    trade_records = []  # (ticker, entry_time, entry_price, size, entry_bar_idx)
+    open_trade = {}  # ticker_id -> {ticker, entry_time, entry_price, size, entry_bar_idx}
+    bar_ticker_strs = all_bars["ticker"].values
 
     for idx in range(n_bars):
         tid = bar_ticker_ids[idx]
@@ -190,13 +190,66 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
         pos = bar_positions[idx]
         prev = bar_prev_positions[idx]
 
+        # ── Stop-loss / take-profit check (every bar, for open positions) ──
+        if is_open[tid] and tid in open_trade and current_shares[tid] > 0:
+            entry_px = open_trade[tid]["entry_price"]
+            ret = (close - entry_px) / entry_px
+            sl_triggered = stop_loss_pct > 0 and ret <= -stop_loss_pct
+            tp_triggered = take_profit_pct > 0 and ret >= take_profit_pct
+            if sl_triggered or tp_triggered:
+                # Force exit — override signal
+                sh_val = current_shares[tid]
+                exit_price = close * (1 - half_spread)
+                tc = abs(exit_price * sh_val) * cost_frac + sh_val * exit_price * half_spread
+                cash += exit_price * sh_val - tc
+                mtm_sum -= sh_val * last_price_arr[tid]
+                current_shares[tid] = 0.0
+                current_ep[tid] = 0.0
+                is_open[tid] = 0
+                n_open -= 1
+                ot = open_trade.pop(tid)
+                gross_pnl = (exit_price - ot["entry_price"]) * ot["size"]
+                trade_records.append({
+                    "entry_time": ot["entry_time"], "exit_time": str(bar_timestamps[idx]),
+                    "ticker": ot["ticker"], "direction": "long",
+                    "entry_price": ot["entry_price"], "exit_price": exit_price,
+                    "size": ot["size"], "gross_pnl": gross_pnl,
+                    "net_pnl": gross_pnl - tc, "costs": tc,
+                    "holding_bars": idx - ot["entry_bar"],
+                    "exit_reason": "stop_loss" if sl_triggered else "take_profit",
+                })
+                last_price_arr[tid] = close
+                eq_timestamps[idx] = bar_timestamps[idx]
+                eq_values[idx] = cash + mtm_sum
+                continue  # already exited, skip normal position logic
+
         if pos == 1 and prev == 0:
-            entry_price = close * (1 + half_spread)
-            size = (capital * position_size_pct) / entry_price
-            cash -= entry_price * size
-            current_ep[tid] = entry_price
-            current_shares[tid] = size
-            mtm_sum += size * close
+            # ── Entry: compute position value based on allocation mode ──
+            if allocation == "confidence-weighted":
+                conf_rank = bar_confidences[idx]
+                pos_value = capital * position_size_pct * (0.5 + 0.5 * conf_rank)
+            else:
+                pos_value = capital * position_size_pct
+
+            if max_position_pct > 0:
+                pos_value = min(pos_value, cash * max_position_pct)
+
+            if max_positions > 0 and n_open >= max_positions:
+                pass  # skip — at capacity
+            else:
+                entry_price = close * (1 + half_spread)
+                size = pos_value / entry_price
+                cash -= entry_price * size
+                current_ep[tid] = entry_price
+                current_shares[tid] = size
+                is_open[tid] = 1
+                n_open += 1
+                mtm_sum += size * close
+                open_trade[tid] = {
+                    "ticker": bar_ticker_strs[idx], "entry_time": str(bar_timestamps[idx]),
+                    "entry_price": entry_price, "size": size, "entry_bar": idx,
+                }
+
         elif pos == 0 and prev == 1:
             sh_val = current_shares[tid]
             exit_price = close * (1 - half_spread)
@@ -205,12 +258,48 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
             mtm_sum -= sh_val * last_price_arr[tid]
             current_shares[tid] = 0.0
             current_ep[tid] = 0.0
+            is_open[tid] = 0
+            n_open -= 1
+
+            ot = open_trade.pop(tid, None)
+            if ot:
+                gross_pnl = (exit_price - ot["entry_price"]) * ot["size"]
+                trade_records.append({
+                    "entry_time": ot["entry_time"], "exit_time": str(bar_timestamps[idx]),
+                    "ticker": ot["ticker"], "direction": "long",
+                    "entry_price": ot["entry_price"], "exit_price": exit_price,
+                    "size": ot["size"], "gross_pnl": gross_pnl,
+                    "net_pnl": gross_pnl - tc, "costs": tc,
+                    "holding_bars": idx - ot["entry_bar"],
+                    "exit_reason": "signal",
+                })
+
         elif pos == 1 and prev == 1:
             mtm_sum += current_shares[tid] * (close - last_price_arr[tid])
 
         last_price_arr[tid] = close
         eq_timestamps[idx] = bar_timestamps[idx]
         eq_values[idx] = cash + mtm_sum
+
+    # Close any remaining open positions at last bar
+    for tid, ot in open_trade.items():
+        if current_shares[tid] > 0:
+            sh_val = current_shares[tid]
+            exit_price = bar_closes[-1]
+            tc = abs(exit_price * sh_val) * cost_frac + sh_val * exit_price * half_spread
+            gross_pnl = (exit_price - ot["entry_price"]) * sh_val
+            trade_records.append({
+                "entry_time": ot["entry_time"], "exit_time": str(bar_timestamps[-1]),
+                "ticker": ot["ticker"], "direction": "long",
+                "entry_price": ot["entry_price"], "exit_price": exit_price,
+                "size": sh_val, "gross_pnl": 0, "net_pnl": 0, "costs": 0,
+                "holding_bars": n_bars - 1 - ot["entry_bar"],
+            })
+
+    trade_df = pd.DataFrame(trade_records) if trade_records else pd.DataFrame(
+        columns=["entry_time", "exit_time", "ticker", "direction", "entry_price",
+                 "exit_price", "size", "gross_pnl", "net_pnl", "costs", "holding_bars",
+                 "exit_reason"])
 
     eq_df = pd.DataFrame({"timestamp": eq_timestamps, "equity": eq_values})
     eq_df = eq_df.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
@@ -266,7 +355,8 @@ class _SimResult:
 
 class LiveSimulator:
     def __init__(self, capital=100_000_000, position_size_pct=0.02,
-                 cost_bps=5, spread_bps=3, latency_bars=1):
+                 cost_bps=5, spread_bps=3, latency_bars=1,
+                 stop_loss_pct=0.0, take_profit_pct=0.0):
         self.initial_capital = capital
         self.equity = capital
         self.cash = capital
@@ -274,6 +364,8 @@ class LiveSimulator:
         self.cost_bps = cost_bps
         self.spread_bps = spread_bps
         self.latency_bars = latency_bars
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
         self.open_positions = {}
         self.pending_signals = []
         self.trade_log = []
@@ -282,7 +374,7 @@ class LiveSimulator:
         self.total_gross_pnl = 0.0
         self.bars_processed = 0
 
-    def _execute_fill(self, signal, bar):
+    def _execute_fill(self, signal, bar, exit_reason="signal"):
         ticker = bar["ticker"]
         price = bar["close"]
         half_spread = price * (self.spread_bps / 2 / 10000)
@@ -315,7 +407,24 @@ class LiveSimulator:
                 "size": pos["size"], "gross_pnl": gross_pnl,
                 "net_pnl": gross_pnl - cost, "costs": pos["costs"] + cost,
                 "holding_bars": pos["holding_bars"],
+                "exit_reason": exit_reason,
             })
+
+    def _check_sl_tp(self, bar):
+        """Check stop-loss/take-profit for the current bar's ticker."""
+        ticker = bar["ticker"]
+        if ticker not in self.open_positions:
+            return False
+        pos = self.open_positions[ticker]
+        price = bar["close"]
+        ret = (price - pos["entry_price"]) / pos["entry_price"]
+        if self.stop_loss_pct > 0 and ret <= -self.stop_loss_pct:
+            self._execute_fill("Sell", bar, exit_reason="stop_loss")
+            return True
+        if self.take_profit_pct > 0 and ret >= self.take_profit_pct:
+            self._execute_fill("Sell", bar, exit_reason="take_profit")
+            return True
+        return False
 
     def process_bar(self, bar, signal):
         while self.pending_signals and self.bars_processed >= self.pending_signals[0][1]:
@@ -348,7 +457,8 @@ class LiveSimulator:
     def get_trade_log_df(self):
         return pd.DataFrame(self.trade_log) if self.trade_log else pd.DataFrame(
             columns=["entry_time","exit_time","ticker","direction","entry_price",
-                     "exit_price","size","gross_pnl","net_pnl","costs","holding_bars"])
+                     "exit_price","size","gross_pnl","net_pnl","costs","holding_bars",
+                     "exit_reason"])
 
     def save_state(self, path):
         path = Path(path)

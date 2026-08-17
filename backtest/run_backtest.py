@@ -25,6 +25,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def main():
     parser = argparse.ArgumentParser(description="Run historical backtest for all models")
+    parser.add_argument("--mode", choices=["portfolio", "single"], default="portfolio",
+                        help="portfolio=multi-stock, single=one ticker")
+    parser.add_argument("--ticker", type=str, default=None,
+                        help="Single ticker symbol (required for single mode)")
+    parser.add_argument("--allocation", choices=["equal", "confidence-weighted", "top-N"],
+                        default="equal", help="Position sizing mode")
+    parser.add_argument("--max-positions", type=int, default=0,
+                        help="Max concurrent positions (0=unlimited)")
+    parser.add_argument("--max-position-pct", type=float, default=0.0,
+                        help="Max fraction of capital per position (0=unlimited)")
     parser.add_argument("--capital", type=float, default=100_000_000)
     parser.add_argument("--position-size", type=float, default=0.02)
     parser.add_argument("--cost-bps", type=float, default=5)
@@ -42,12 +52,16 @@ def main():
     parser.add_argument("--checkpoint-dir", default=str(PROJECT_ROOT / "models" / "checkpoints"))
     args = parser.parse_args()
 
+    if args.mode == "single" and not args.ticker:
+        parser.error("--ticker is required for single mode")
+
     data_dir = Path(args.data_dir)
     ckpt_dir = Path(args.checkpoint_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Mode: {args.mode}" + (f" ({args.ticker})" if args.ticker else ""))
+    print(f"Allocation: {args.allocation}")
 
-    # Step 1: Generate signals for each model
     from backtest.generate_signals import generate_historical_signals, LABEL_MAP
     from backtest.simulator import run_historical_backtest
     from backtest.analytics import comparison_table, print_comparison_table, save_comparison_csv
@@ -62,11 +76,14 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load prices once (needed for all models)
     print("\nLoading validation prices...")
     prices_df = pd.read_parquet(str(data_dir / "val.parquet"),
                                  columns=["ticker", "timestamp", "open", "high", "low", "close", "volume"])
-    print(f"  {len(prices_df):,} bars")
+    if args.ticker:
+        prices_df = prices_df[prices_df["ticker"] == args.ticker]
+        print(f"  Filtered to {args.ticker}: {len(prices_df):,} bars")
+    else:
+        print(f"  {len(prices_df):,} bars")
 
     results_dict = {}
     signals_dict = {}
@@ -77,7 +94,6 @@ def main():
         print(f"  {model_name.upper()}")
         print(f"{'='*60}")
 
-        # Step 1: Generate signals
         t0 = time.time()
         sig_path = signals_dir / f"{model_name}_val_signals.parquet"
         if sig_path.exists():
@@ -89,11 +105,12 @@ def main():
                 model_name, str(ckpt_dir), str(data_dir), device,
                 str(signals_dir), args.batch_size, args.stride
             )
+        if args.ticker:
+            signals_df = signals_df[signals_df["ticker"] == args.ticker]
         print(f"  Signals: {len(signals_df):,} ({time.time()-t0:.1f}s)")
 
         signals_dict[model_name] = signals_df
 
-        # Step 2: Run simulator
         t0 = time.time()
         model_results_dir = results_dir / model_name
         sim = run_historical_backtest(
@@ -103,13 +120,15 @@ def main():
             latency_bars=args.latency, output_dir=str(model_results_dir),
             confidence_threshold=args.confidence_threshold,
             min_holding_bars=args.min_holding_bars,
+            max_positions=args.max_positions,
+            max_position_pct=args.max_position_pct,
+            allocation=args.allocation,
         )
         eq_df = sim.get_equity_curve_df()
         trades_df = sim.get_trade_log_df()
         print(f"  Simulator: {len(eq_df):,} bars, {len(trades_df)} trades ({time.time()-t0:.1f}s)")
         results_dict[model_name] = {"equity_curve": eq_df, "trade_log": trades_df, "sim": sim}
 
-        # Step 5: Monte Carlo
         t0 = time.time()
         mc_results[model_name] = run_monte_carlo(
             trades_df, eq_df, model_name,
@@ -117,12 +136,10 @@ def main():
         )
         print(f"  Monte Carlo: {time.time()-t0:.1f}s")
 
-    # Step 3: Analytics comparison
     print("\n\n")
     metrics_df = print_comparison_table(results_dict, args.risk_free_rate)
     save_comparison_csv(results_dict, str(reports_dir / "comparison_table.csv"), args.risk_free_rate)
 
-    # ── Before/After filter comparison ──────────────────────────────
     if args.confidence_threshold > 0 or args.min_holding_bars > 1:
         print("\n" + "=" * 90)
         print("  FILTER IMPACT: Before vs After")
@@ -139,11 +156,9 @@ def main():
                       f"{fs['cost_pct_before']:>12.1f}% {fs['cost_pct_after']:>11.1f}%")
         print("=" * 90)
 
-    # Step 4: Static visualizations
     print("\nGenerating static charts...")
     generate_all_static_charts(results_dict, signals_dict, prices_df)
 
-    # Print summary
     print("\n" + "=" * 60)
     print("  BACKTEST COMPLETE")
     print("=" * 60)

@@ -135,6 +135,19 @@ with st.sidebar:
     selected_models = st.multiselect("Models", model_options, default=model_options)
 
     st.markdown("---")
+    st.markdown("### Trading Mode")
+    trading_mode = st.radio("Trading Mode", ["Portfolio (Multi-Stock)", "Single Stock"],
+                            index=0, key="trading_mode")
+    ticker_filter = None
+    if trading_mode == "Single Stock":
+        ticker_filter = st.text_input("Ticker Symbol", "RELIANCE")
+        st.caption("e.g., RELIANCE, TCS, INFY, HDFCBANK")
+
+    allocation = st.selectbox("Allocation", ["equal", "confidence-weighted", "top-N"], index=0)
+    max_positions = st.number_input("Max Positions (0=unlimited)", value=0, min_value=0, step=1)
+    max_pos_pct = st.slider("Max Position %", 0.0, 50.0, 10.0, 1.0) / 100 if max_positions > 0 else 0.0
+
+    st.markdown("---")
     st.markdown("### Position & Costs")
     capital = st.number_input("Starting Capital (₹)", value=100_000_000, step=10_000_000)
     position_size = st.slider("Position Size %", 0.5, 10.0, 2.0, 0.5) / 100
@@ -148,7 +161,8 @@ with st.sidebar:
     if mode == "Live Paper Trading":
         st.markdown("---")
         st.markdown("### Live Settings")
-        live_tickers = st.text_input("Tickers (space-separated)", "RELIANCE TCS INFY HDFCBANK ICICIBANK")
+        live_tickers = st.text_input("Tickers (space-separated)",
+                                      ticker_filter if ticker_filter else "RELIANCE TCS INFY HDFCBANK ICICIBANK")
         replay_speed = st.slider("Replay Speed (sec/bar)", 0.1, 5.0, 2.0, 0.1)
         refresh_rate = st.slider("Refresh (sec)", 5, 60, 10)
 
@@ -159,9 +173,9 @@ PLOTLY_COLORS = {"lstm": "#58a6ff", "cnn1d": "#d29922", "cnn_lstm": "#3fb950"}
 
 
 # ── Tabs ─────────────────────────────────────────────────────────────
-tab_overview, tab_equity, tab_trades, tab_mc, tab_compare, tab_live = st.tabs([
+tab_overview, tab_equity, tab_trades, tab_mc, tab_compare, tab_modes, tab_live = st.tabs([
     "📊 Overview", "📈 Equity Curves", "🔍 Trade Explorer",
-    "🎲 Monte Carlo", "⚖️ Model Comparison", "🔴 Live Paper Trading",
+    "🎲 Monte Carlo", "⚖️ Model Comparison", "🔀 Mode Comparison", "🔴 Live Paper Trading",
 ])
 
 # ── Overview ─────────────────────────────────────────────────────────
@@ -457,6 +471,100 @@ with tab_compare:
         fig.update_layout(template=PLOTLY_TEMPLATE, height=400, barmode="group",
                           margin=dict(l=50, r=20, t=50, b=30))
         st.plotly_chart(fig, use_container_width=True)
+
+# ── Mode Comparison ───────────────────────────────────────────────────
+with tab_modes:
+    st.markdown("## 🔀 Mode Comparison: B&H vs Model vs Allocation")
+
+    mode_csv = REPORTS_DIR / "mode_comparison.csv"
+    if not mode_csv.exists():
+        st.info("Run `python backtest/mode_comparison.py` to generate mode comparison data.")
+    else:
+        mdf = pd.read_csv(mode_csv)
+        # Rename for display
+        rename_map = {
+            "B&H": "Buy & Hold",
+            "equal-weight": "Equal Weight",
+            "conf-weighted": "Conf-Weighted",
+            "top-N": "Top-N",
+            "single-model": "Single (Model)",
+            "single-BH": "Single (B&H)",
+        }
+        mdf["mode_label"] = mdf["mode"].map(rename_map).fillna(mdf["mode"])
+
+        # Key metrics table
+        st.markdown("### All Modes")
+        display_cols = ["mode_label", "model", "config", "total_return", "sharpe",
+                         "max_drawdown", "n_trades", "win_rate"]
+        display = mdf[display_cols].copy()
+        display["total_return"] = display["total_return"].apply(lambda x: f"{x*100:+.2f}%")
+        display["sharpe"] = display["sharpe"].apply(lambda x: f"{x:.3f}")
+        display["max_drawdown"] = display["max_drawdown"].apply(lambda x: f"{x*100:.2f}%")
+        display["win_rate"] = display["win_rate"].apply(lambda x: f"{x:.1%}")
+        display = display.rename(columns={
+            "mode_label": "Mode", "model": "Model", "config": "Config",
+            "total_return": "Return", "sharpe": "Sharpe",
+            "max_drawdown": "MaxDD", "n_trades": "Trades", "win_rate": "WinRate",
+        })
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        # Portfolio modes comparison chart
+        st.markdown("### Portfolio Modes — Return & Sharpe")
+        portfolio_modes = mdf[mdf["mode"].isin(["B&H", "equal-weight", "conf-weighted", "top-N"])]
+        if len(portfolio_modes) > 0:
+            fig = make_subplots(rows=1, cols=2,
+                                subplot_titles=["Total Return (%)", "Sharpe Ratio"])
+            for _, row in portfolio_modes.iterrows():
+                label = f"{row['mode_label']} ({row['model']})" if row["mode"] != "B&H" else "Buy & Hold"
+                fig.add_trace(go.Bar(
+                    name=label, x=[label], y=[row["total_return"] * 100],
+                    showlegend=False,
+                ), row=1, col=1)
+                fig.add_trace(go.Bar(
+                    name=label, x=[label], y=[row["sharpe"]],
+                    showlegend=False,
+                ), row=1, col=2)
+            fig.update_layout(template=PLOTLY_TEMPLATE, height=400, barmode="group",
+                              margin=dict(l=50, r=20, t=50, b=30))
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Single-stock comparison
+        st.markdown("### Single-Stock: Model vs Buy-and-Hold")
+        single_data = mdf[mdf["mode"].isin(["single-model", "single-BH"])]
+        if len(single_data) > 0:
+            pivot = single_data.pivot_table(index="config", columns="mode",
+                                             values="total_return", aggfunc="first")
+            if "single-model" in pivot.columns and "single-BH" in pivot.columns:
+                pivot["alpha"] = pivot["single-model"] - pivot["single-BH"]
+                pivot = pivot.sort_values("alpha", ascending=False)
+
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    name="Model", x=pivot.index.tolist(),
+                    y=(pivot["single-model"] * 100).tolist(),
+                    marker_color="#58a6ff",
+                ))
+                fig.add_trace(go.Bar(
+                    name="Buy & Hold", x=pivot.index.tolist(),
+                    y=(pivot["single-BH"] * 100).tolist(),
+                    marker_color="#666",
+                ))
+                fig.update_layout(
+                    template=PLOTLY_TEMPLATE, barmode="group",
+                    title="Single-Stock: Model Return vs Buy-and-Hold",
+                    yaxis_title="Return (%)", height=400,
+                    margin=dict(l=50, r=20, t=50, b=30),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Alpha table
+                alpha_df = pd.DataFrame({
+                    "Ticker": pivot.index,
+                    "Model Return": (pivot["single-model"] * 100).apply(lambda x: f"{x:+.2f}%"),
+                    "B&H Return": (pivot["single-BH"] * 100).apply(lambda x: f"{x:+.2f}%"),
+                    "Alpha (pp)": (pivot["alpha"] * 100).apply(lambda x: f"{x:+.1f}pp"),
+                })
+                st.dataframe(alpha_df, use_container_width=True, hide_index=True)
 
 # ── Live Paper Trading ───────────────────────────────────────────────
 with tab_live:

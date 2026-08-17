@@ -5,6 +5,7 @@ on each, and reports results transparently (including losing periods).
 No re-optimization per period. This tests whether the config we selected
 on the full set generalizes to unseen time slices.
 """
+import argparse
 import sys, time
 from pathlib import Path
 import pandas as pd
@@ -43,10 +44,12 @@ SIGNALS_DIR = PROJECT_ROOT / "backtest" / "signals"
 REPORTS_DIR = PROJECT_ROOT / "backtest" / "reports"
 
 
-def run_walk_forward():
+def run_walk_forward(stop_loss_pct=0.0, take_profit_pct=0.0):
     print("=" * 100)
     print("  WALK-FORWARD VALIDATION")
     print(f"  Config: confidence={CONFIDENCE_THRESHOLD}, min_hold={MIN_HOLDING_BARS}")
+    if stop_loss_pct > 0 or take_profit_pct > 0:
+        print(f"  SL/TP: stop_loss={stop_loss_pct:.1%}, take_profit={take_profit_pct:.1%}")
     print(f"  Models: {MODELS}")
     print(f"  Periods: {len(PERIODS)}")
     print("=" * 100)
@@ -111,6 +114,8 @@ def run_walk_forward():
                 latency_bars=LATENCY_BARS, output_dir=None,
                 confidence_threshold=CONFIDENCE_THRESHOLD,
                 min_holding_bars=MIN_HOLDING_BARS,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
             )
             eq = sim.get_equity_curve_df()
             trades = sim.get_trade_log_df()
@@ -243,10 +248,17 @@ def run_walk_forward():
                 })
     if rows:
         df = pd.DataFrame(rows)
-        out = REPORTS_DIR / "walk_forward_results.csv"
+        suffix = ""
+        if stop_loss_pct > 0 or take_profit_pct > 0:
+            suffix = f"_sl{stop_loss_pct:.2f}_tp{take_profit_pct:.2f}"
+        out = REPORTS_DIR / f"walk_forward_results{suffix}.csv"
         df.to_csv(out, index=False)
         print(f"\n  Saved → {out}")
 
 
 if __name__ == "__main__":
-    run_walk_forward()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stop-loss", type=float, default=0.0, help="Stop-loss fraction (e.g. 0.05 for 5%%)")
+    parser.add_argument("--take-profit", type=float, default=0.0, help="Take-profit fraction (e.g. 0.10 for 10%%)")
+    args = parser.parse_args()
+    run_walk_forward(stop_loss_pct=args.stop_loss, take_profit_pct=args.take_profit)

@@ -39,3 +39,4 @@ logs/
 
 # Env secrets
 .env
+backtest/*.db

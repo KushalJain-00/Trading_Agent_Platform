@@ -1,0 +1,2 @@
+backtest/*.db filter=lfs diff=lfs merge=lfs -text
+backtest/*.db.gz filter=lfs diff=lfs merge=lfs -text
