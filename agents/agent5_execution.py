@@ -48,7 +48,7 @@ class ExecutionAgent:
                 "SELECT bar_idx, ticker, timestamp, signal, confidence, model FROM signals", conn
             )
             portfolio = pd.read_sql(
-                "SELECT ticker, timestamp FROM portfolio", conn
+                "SELECT ticker, timestamp, size_pct FROM portfolio", conn
             )
 
         if len(signals) == 0:
@@ -59,6 +59,11 @@ class ExecutionAgent:
 
         # Mark which (ticker, timestamp) pairs are in the portfolio (approved Buys)
         portfolio_set = set(zip(portfolio["ticker"], portfolio["timestamp"]))
+        # Build size_pct lookup from portfolio
+        size_pct_map = dict(zip(
+            zip(portfolio["ticker"], portfolio["timestamp"]),
+            portfolio["size_pct"]
+        ))
 
         # For Buy signals: keep only if in portfolio (regime-approved)
         # Hold and Sell signals pass through unchanged (needed for exits)
@@ -66,6 +71,11 @@ class ExecutionAgent:
         buy_mask = merged["signal"] == "Buy"
         approved = merged.apply(lambda r: (r["ticker"], r["timestamp"]) in portfolio_set, axis=1)
         merged.loc[buy_mask & ~approved, "signal"] = "Hold"
+
+        # Merge size_pct from portfolio for approved buys
+        merged["size_pct"] = merged.apply(
+            lambda r: size_pct_map.get((r["ticker"], r["timestamp"]), 0.02), axis=1
+        )
 
         merged["predicted_signal"] = merged["signal"]
         merged["predicted_confidence"] = merged["confidence"]
@@ -83,7 +93,7 @@ class ExecutionAgent:
                            "n_sells": n_sells, "n_holds": n_holds},
                   db_path=self.db_path)
 
-        return merged[["ticker", "timestamp", "predicted_signal", "predicted_confidence", "model"]]
+        return merged[["ticker", "timestamp", "predicted_signal", "predicted_confidence", "model", "size_pct"]]
 
     def run_backtest(self, prices_df, output_dir=None):
         """Run the existing simulator with merged multi-agent signals."""

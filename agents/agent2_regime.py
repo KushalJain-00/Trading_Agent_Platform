@@ -25,14 +25,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.schema import get_conn, log_agent, init_db
 
-# ── Thresholds ───────────────────────────────────────────────────────
+# ── Thresholds (defaults, overridable via constructor) ────────────────
 VOL_LOOKBACK = 20
 VOL_PERCENTILE_WINDOW = 252
 VOL_HIGH_PCT = 70
 VOL_LOW_PCT = 30
 TREND_FAST_MA = 10
 TREND_SLOW_MA = 30
-TREND_STRENGTH_THRESHOLD = 0.002
+TREND_STRENGTH_THRESHOLD = 0.0005  # 0.05% — calibrated for 1-minute data
 DRAWDOWN_THRESHOLD = -0.10
 
 
@@ -49,7 +49,8 @@ def compute_market_index(prices_df):
     return index_price, index_returns
 
 
-def classify_regime_vectorized(index_price, index_returns):
+def classify_regime_vectorized(index_price, index_returns,
+                                trend_threshold=TREND_STRENGTH_THRESHOLD):
     """Vectorized regime classification across the full timeline."""
     n = len(index_price)
 
@@ -57,12 +58,6 @@ def classify_regime_vectorized(index_price, index_returns):
     rolling_vol = index_returns.rolling(VOL_LOOKBACK).std() * np.sqrt(252 * 375)
 
     # ── Vol percentile over rolling window ─────────────────────────
-    # For each bar, what percentile is the current vol in vs last N bars?
-    vol_pctile = rolling_vol.rolling(VOL_PERCENTILE_WINDOW).apply(
-        lambda x: (x.iloc[-1] > x[:-1]).sum() / max(len(x) - 1, 1) * 100,
-        raw=False
-    )
-    # Simpler: rank within rolling window
     vol_pctile = rolling_vol.rolling(VOL_PERCENTILE_WINDOW).rank(pct=True) * 100
 
     is_volatile = vol_pctile >= VOL_HIGH_PCT
@@ -72,7 +67,7 @@ def classify_regime_vectorized(index_price, index_returns):
     fast_ma = index_price.rolling(TREND_FAST_MA).mean()
     slow_ma = index_price.rolling(TREND_SLOW_MA).mean()
     ma_spread = (fast_ma - slow_ma) / slow_ma
-    is_trending = ma_spread.abs() >= TREND_STRENGTH_THRESHOLD
+    is_trending = ma_spread.abs() >= trend_threshold
 
     # ── Drawdown from peak ─────────────────────────────────────────
     peak = index_price.cummax()
@@ -125,8 +120,9 @@ def classify_regime_vectorized(index_price, index_returns):
 class RegimeAgent:
     """Regime detection agent — vectorized classification."""
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, trend_threshold=TREND_STRENGTH_THRESHOLD):
         self.db_path = db_path
+        self.trend_threshold = trend_threshold
 
     def run_backtest(self, prices_df):
         """Classify regime for every unique timestamp. Writes to DB."""
@@ -136,7 +132,7 @@ class RegimeAgent:
         timestamps = index_price.index.tolist()
 
         regime_labels, regime_confidences, features_list = classify_regime_vectorized(
-            index_price, index_returns
+            index_price, index_returns, trend_threshold=self.trend_threshold
         )
 
         records = []

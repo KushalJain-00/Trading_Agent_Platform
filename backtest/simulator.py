@@ -98,7 +98,12 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
     max_positions: max concurrent open positions (0=unlimited)
     max_position_pct: max fraction of capital per position (0=unlimited)
     """
-    sigs = signals_df[["ticker", "timestamp", "predicted_signal", "predicted_confidence"]].copy()
+    # Preserve size_pct column if present (multi-agent regime-scaled sizing)
+    has_size_pct = "size_pct" in signals_df.columns
+    cols = ["ticker", "timestamp", "predicted_signal", "predicted_confidence"]
+    if has_size_pct:
+        cols.append("size_pct")
+    sigs = signals_df[cols].copy()
     sigs["timestamp"] = pd.to_datetime(sigs["timestamp"])
 
     px = prices_df[["ticker", "timestamp", "close"]].copy()
@@ -157,6 +162,7 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
     bar_closes = all_bars["close"].values.astype(np.float64)
     bar_positions = all_bars["position"].values.astype(np.int64)
     bar_tickers = all_bars["ticker"].values
+    bar_size_pcts = all_bars["size_pct"].values if has_size_pct else None
     bar_timestamps = all_bars["timestamp"].values
     bar_confidences = all_bars["predicted_confidence"].values.astype(np.float64)
     bar_prev_positions = all_bars.groupby("ticker")["position"].shift(1).fillna(0).values.astype(np.int64)
@@ -225,7 +231,9 @@ def _run_backtest_core(signals_df, prices_df, capital, position_size_pct,
 
         if pos == 1 and prev == 0:
             # ── Entry: compute position value based on allocation mode ──
-            if allocation == "confidence-weighted":
+            if bar_size_pcts is not None:
+                pos_value = capital * bar_size_pcts[idx]
+            elif allocation == "confidence-weighted":
                 conf_rank = bar_confidences[idx]
                 pos_value = capital * position_size_pct * (0.5 + 0.5 * conf_rank)
             else:

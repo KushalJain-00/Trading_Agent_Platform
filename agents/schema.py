@@ -79,12 +79,51 @@ CREATE TABLE IF NOT EXISTS agent_log (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS latency_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bar_idx INTEGER,
+    ticker TEXT,
+    timestamp TEXT NOT NULL,
+    stage TEXT NOT NULL,            -- 'feature_compute' | 'model_inference' | 'signal_decision' | 'full_pipeline'
+    latency_ms REAL NOT NULL,
+    model TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS manual_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    action TEXT NOT NULL,           -- Buy/Sell
+    price REAL NOT NULL,
+    size REAL NOT NULL,
+    reason TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS news_articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    summary TEXT,
+    source TEXT,
+    url TEXT,
+    published_at TEXT,
+    sentiment_score REAL,           -- -1.0 (bearish) to +1.0 (bullish)
+    relevance_score REAL,           -- 0.0 to 1.0
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_bar ON signals(bar_idx);
 CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
 CREATE INDEX IF NOT EXISTS idx_regime_bar ON regime(bar_idx);
 CREATE INDEX IF NOT EXISTS idx_portfolio_bar ON portfolio(bar_idx);
 CREATE INDEX IF NOT EXISTS idx_executions_bar ON executions(bar_idx);
 CREATE INDEX IF NOT EXISTS idx_agent_log_bar ON agent_log(bar_idx);
+CREATE INDEX IF NOT EXISTS idx_latency_bar ON latency_metrics(bar_idx);
+CREATE INDEX IF NOT EXISTS idx_manual_trades_ticker ON manual_trades(ticker);
+CREATE INDEX IF NOT EXISTS idx_news_ticker ON news_articles(ticker);
+CREATE INDEX IF NOT EXISTS idx_news_published ON news_articles(published_at);
 """
 
 

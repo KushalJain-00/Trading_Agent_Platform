@@ -43,11 +43,12 @@ MIN_CONFIDENCE = 0.45
 class PortfolioAgent:
     """Portfolio optimization agent — batch-processed for speed."""
 
-    def __init__(self, db_path=None, config=None):
+    def __init__(self, db_path=None, config=None, regime_exposure=None):
         self.db_path = db_path
         self.max_positions = config.get("max_positions", MAX_POSITIONS) if config else MAX_POSITIONS
         self.max_position_pct = config.get("max_position_pct", MAX_POSITION_PCT) if config else MAX_POSITION_PCT
         self.base_position_pct = config.get("base_position_pct", BASE_POSITION_PCT) if config else BASE_POSITION_PCT
+        self.regime_exposure = regime_exposure or REGIME_EXPOSURE
 
     def run_backtest(self):
         """Process all signals, write target allocations to DB. Batch-loaded."""
@@ -80,7 +81,7 @@ class PortfolioAgent:
 
         # Filter to buys above confidence
         buys = merged[(merged["signal"] == "Buy") & (merged["confidence"] >= MIN_CONFIDENCE)].copy()
-        buys["regime_scale"] = buys["regime_label"].map(REGIME_EXPOSURE).fillna(0.5)
+        buys["regime_scale"] = buys["regime_label"].map(self.regime_exposure).fillna(0.5)
 
         # Per-timestamp: rank by confidence, limit to max_positions
         records = []

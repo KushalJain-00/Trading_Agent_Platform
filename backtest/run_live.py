@@ -86,11 +86,14 @@ def main():
 
     def process_bar(bar, source="replay"):
         ticker = bar["ticker"]
+        pipeline_start = time.perf_counter()
 
         for name, model in models.items():
             # Get features: pre-computed _z columns from replay, or compute from raw for live
+            t_feat = time.perf_counter()
             if all(fc in bar for fc in feature_cols):
                 feats = np.array([bar[fc] for fc in feature_cols], dtype=np.float32)
+                feat_latency = (time.perf_counter() - t_feat) * 1000
             else:
                 # Live mode: need to compute from raw OHLCV (skip until enough history)
                 ticker_bars[name].append(bar)
@@ -107,16 +110,29 @@ def main():
                     feats = last_row[z_cols_build].values.astype(np.float32)
                 except Exception:
                     continue
+                feat_latency = (time.perf_counter() - t_feat) * 1000
 
             window_buffers[name].append(feats)
             if len(window_buffers[name]) < window_size:
                 continue
 
             window_array = np.array(list(window_buffers[name])[-window_size:])
+            t_infer = time.perf_counter()
             sig = generate_live_signal(
                 model, pd.DataFrame(window_array, columns=feature_cols),
                 norm_mean, norm_std, device,
             )
+            infer_latency = (time.perf_counter() - t_infer) * 1000
+            pipeline_latency = (time.perf_counter() - pipeline_start) * 1000
+
+            # Log latency metrics
+            _log_latency(state_dir / "latency.jsonl", {
+                "ts": str(bar.get("timestamp", "")),
+                "ticker": ticker, "model": name, "source": source,
+                "feat_ms": round(feat_latency, 1),
+                "infer_ms": round(infer_latency, 1),
+                "pipeline_ms": round(pipeline_latency, 1),
+            })
 
             sim = sims[name]
             sim.process_bar(bar, sig["signal"])
@@ -190,6 +206,15 @@ def main():
             _save_state(state_dir, sims)
             print(f"  Sleeping {args.poll_interval}s...")
             time.sleep(args.poll_interval)
+
+
+def _log_latency(path, record):
+    """Append a latency record to a JSONL file for dashboard consumption."""
+    import os
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def _save_state(state_dir, sims):
